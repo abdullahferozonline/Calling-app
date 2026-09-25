@@ -1,12 +1,149 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-  <title>Call App</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A simple private peer-to-peer video calling app.">
+  <title>Calling App</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 1rem; background: #0b1020; color: #f8fafc; }
+    main { width: min(100%, 920px); }
+    h1 { margin: 0 0 .35rem; font-size: clamp(2rem, 6vw, 3.5rem); }
+    .subtle, #status { color: #aab6d3; }
+    .panel { margin-top: 1.25rem; padding: 1rem; border: 1px solid #273555; border-radius: 18px; background: #121a2d; box-shadow: 0 15px 50px #0005; }
+    form { display: flex; gap: .6rem; flex-wrap: wrap; }
+    input, button { border: 0; border-radius: 10px; padding: .8rem 1rem; font: inherit; }
+    input { flex: 1 1 220px; background: #202b46; color: inherit; outline: 2px solid transparent; }
+    input:focus { outline-color: #58a6ff; }
+    button { cursor: pointer; background: #3478f6; color: white; font-weight: 700; }
+    button.secondary { background: #293650; }
+    button.danger { background: #d94b63; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-top: 1rem; }
+    video { width: 100%; aspect-ratio: 16/10; object-fit: cover; background: #060912; border-radius: 14px; }
+    .controls { display: flex; justify-content: center; gap: .6rem; margin-top: 1rem; flex-wrap: wrap; }
+    .hidden { display: none; }
+    .notice { min-height: 1.5em; }
+  </style>
 </head>
-<body style="text-align:center; font-family:sans-serif;">
+<body>
+<main>
+  <h1>📞 Calling App</h1>
+  <p class="subtle">Private, peer-to-peer video calls. Share the same room name with one other person.</p>
+  <section class="panel">
+    <form id="join-form">
+      <input id="room" autocomplete="off" maxlength="64" placeholder="Room name (e.g. family-123)" required>
+      <button type="submit">Join call</button>
+    </form>
+    <p id="status" class="notice" role="status">Choose a room to begin.</p>
+    <div id="call" class="hidden">
+      <div class="videos">
+        <video id="local-video" autoplay muted playsinline></video>
+        <video id="remote-video" autoplay playsinline></video>
+      </div>
+      <div class="controls">
+        <button id="mute" class="secondary" type="button">Mute</button>
+        <button id="camera" class="secondary" type="button">Camera off</button>
+        <button id="leave" class="danger" type="button">Leave call</button>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+(() => {
+  const socket = io();
+  const form = document.querySelector('#join-form');
+  const roomInput = document.querySelector('#room');
+  const status = document.querySelector('#status');
+  const call = document.querySelector('#call');
+  const localVideo = document.querySelector('#local-video');
+  const remoteVideo = document.querySelector('#remote-video');
+  const joinButton = form.querySelector('button');
+  let room = '', localStream = null, peer = null, pendingCandidates = [];
 
-<h1>🚀 Call App Working</h1>
-<p>If you see this, frontend is working!</p>
+  const setStatus = (message) => { status.textContent = message; };
+  const signal = (type, payload) => socket.emit('signal', { room, type, payload });
 
+  async function createPeer() {
+    peer = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    localStream.getTracks().forEach(track => peer.addTrack(track, localStream));
+    peer.onicecandidate = event => { if (event.candidate) signal('candidate', event.candidate); };
+    peer.ontrack = event => { remoteVideo.srcObject = event.streams[0]; };
+    peer.onconnectionstatechange = () => {
+      if (['failed', 'disconnected'].includes(peer.connectionState)) setStatus('Connection lost. Try leaving and joining again.');
+    };
+  }
+
+  async function startOffer() {
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    signal('offer', peer.localDescription);
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    room = roomInput.value.trim();
+    if (!room) return;
+    joinButton.disabled = true;
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localVideo.srcObject = localStream;
+      await createPeer();
+      socket.emit('join', { room });
+      form.classList.add('hidden');
+      call.classList.remove('hidden');
+      setStatus(`Waiting for someone to join room “${room}”…`);
+    } catch (error) {
+      joinButton.disabled = false;
+      setStatus(error.name === 'NotAllowedError' ? 'Camera and microphone permission is required.' : `Could not start camera: ${error.message}`);
+    }
+  });
+
+  socket.on('joined', data => { if (data.count === 2) setStatus('Connected.'); });
+  socket.on('peer-joined', async () => { setStatus('Peer joined. Connecting…'); await startOffer(); });
+  socket.on('signal', async ({ type, payload }) => {
+    try {
+      if (type === 'offer') {
+        await peer.setRemoteDescription(payload);
+        for (const candidate of pendingCandidates) await peer.addIceCandidate(candidate);
+        pendingCandidates = [];
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        signal('answer', peer.localDescription);
+      } else if (type === 'answer') {
+        await peer.setRemoteDescription(payload);
+        for (const candidate of pendingCandidates) await peer.addIceCandidate(candidate);
+        pendingCandidates = [];
+      } else if (type === 'candidate') {
+        if (peer.remoteDescription) await peer.addIceCandidate(payload);
+        else pendingCandidates.push(payload);
+      }
+    } catch (error) { setStatus(`Call setup failed: ${error.message}`); }
+  });
+  socket.on('room-full', data => { setStatus(data.message); joinButton.disabled = false; });
+  socket.on('peer-left', () => { remoteVideo.srcObject = null; setStatus('The other person left the call.'); });
+  socket.on('connect_error', () => setStatus('Unable to connect to the signaling server.'));
+  socket.on('error', data => { setStatus(data.message || 'An error occurred.'); joinButton.disabled = false; });
+
+  document.querySelector('#mute').onclick = event => {
+    const track = localStream?.getAudioTracks()[0]; if (!track) return;
+    track.enabled = !track.enabled; event.target.textContent = track.enabled ? 'Mute' : 'Unmute';
+  };
+  document.querySelector('#camera').onclick = event => {
+    const track = localStream?.getVideoTracks()[0]; if (!track) return;
+    track.enabled = !track.enabled; event.target.textContent = track.enabled ? 'Camera off' : 'Camera on';
+  };
+  document.querySelector('#leave').onclick = () => {
+    socket.emit('leave', { room });
+    localStream?.getTracks().forEach(track => track.stop());
+    peer?.close(); remoteVideo.srcObject = null; localVideo.srcObject = null;
+    call.classList.add('hidden'); form.classList.remove('hidden'); joinButton.disabled = false;
+    setStatus('You left the call.'); room = '';
+  };
+})();
+</script>
 </body>
 </html>
